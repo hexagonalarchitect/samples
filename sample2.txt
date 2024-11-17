@@ -1,0 +1,188 @@
+package com.example.dynamodbwriter;
+
+import software.amazon.awssdk.core.client.config.ClientOverrideConfiguration;
+import software.amazon.awssdk.core.exception.SdkException;
+import software.amazon.awssdk.core.retry.RetryPolicy;
+import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
+import software.amazon.awssdk.services.dynamodb.model.*;
+import io.github.resilience4j.circuitbreaker.*;
+import io.github.resilience4j.ratelimiter.*;
+import io.github.resilience4j.decorators.Decorators;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.time.Duration;
+import java.util.*;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+
+public class DynamoDBWriter {
+
+    private static final Logger logger = LoggerFactory.getLogger(DynamoDBWriter.class);
+
+    private DynamoDbClient dynamoDbClient;
+    private final String tableName = "YourTableName";
+    private final RateLimiter rateLimiter;
+    private final CircuitBreaker circuitBreaker;
+
+    // Provisioned capacity and item size configuration
+    private final int provisionedWCUs = 5; // Adjust based on your provisioned WCUs
+    private final int itemSizeInBytes = 1024; // Adjust based on your item size in bytes
+
+    public DynamoDBWriter() {
+        // Configure the SDK's retry policy
+        RetryPolicy retryPolicy = RetryPolicy.builder()
+                .numRetries(5) // Maximum number of retries
+                .build();
+
+        ClientOverrideConfiguration clientConfig = ClientOverrideConfiguration.builder()
+                .retryPolicy(retryPolicy)
+                .build();
+
+        // Initialize DynamoDB client
+        this.dynamoDbClient = DynamoDbClient.builder()
+                .overrideConfiguration(clientConfig)
+                .build();
+
+        // Calculate allowed writes per second
+        int wcusPerItem = (int) Math.ceil((double) itemSizeInBytes / 1024);
+        int allowedWritesPerSecond = provisionedWCUs / wcusPerItem;
+
+        // Calculate allowed batches per second
+        int itemsPerBatch = 25; // Max items per batch write
+        int allowedBatchesPerSecond = Math.max(1, allowedWritesPerSecond / itemsPerBatch);
+
+        logger.info("Configured allowedWritesPerSecond: {}", allowedWritesPerSecond);
+        logger.info("Configured allowedBatchesPerSecond: {}", allowedBatchesPerSecond);
+
+        // Configure RateLimiter based on calculated values
+        RateLimiterConfig rateLimiterConfig = RateLimiterConfig.custom()
+                .limitForPeriod(allowedBatchesPerSecond)
+                .limitRefreshPeriod(Duration.ofSeconds(1))
+                .timeoutDuration(Duration.ofMillis(500))
+                .build();
+
+        this.rateLimiter = RateLimiter.of("dynamoRateLimiter", rateLimiterConfig);
+
+        // Configure CircuitBreaker
+        CircuitBreakerConfig circuitBreakerConfig = CircuitBreakerConfig.custom()
+                .failureRateThreshold(50)
+                .minimumNumberOfCalls(5)
+                .waitDurationInOpenState(Duration.ofSeconds(30))
+                .recordExceptions(
+                        ProvisionedThroughputExceededException.class,
+                        InternalServerErrorException.class,
+                        ResourceNotFoundException.class,
+                        SdkException.class)
+                .build();
+
+        this.circuitBreaker = CircuitBreaker.of("dynamoCircuitBreaker", circuitBreakerConfig);
+
+        // Add event listeners for monitoring
+        circuitBreaker.getEventPublisher()
+                .onStateTransition(event -> logger.warn("CircuitBreaker state changed: {}", event))
+                .onFailureRateExceeded(event -> logger.warn("Failure rate exceeded: {}", event));
+
+        rateLimiter.getEventPublisher()
+                .onFailure(event -> logger.warn("RateLimiter failure: {}", event));
+    }
+
+    public void writeItems(List<Map<String, AttributeValue>> itemsToWrite) {
+        List<List<Map<String, AttributeValue>>> batches = partitionList(itemsToWrite, 25);
+
+        for (List<Map<String, AttributeValue>> batch : batches) {
+            // Wait for permission from the rate limiter
+            RateLimiter.waitForPermission(rateLimiter);
+
+            // Use the circuit breaker
+            writeBatchWithCircuitBreaker(batch);
+        }
+    }
+
+    private void writeBatchWithCircuitBreaker(List<Map<String, AttributeValue>> batch) {
+        Supplier<Void> writeSupplier = () -> {
+            writeBatchWithSdkRetries(batch);
+            return null;
+        };
+
+        Supplier<Void> decoratedSupplier = Decorators.ofSupplier(writeSupplier)
+                .withCircuitBreaker(circuitBreaker)
+                .decorate();
+
+        try {
+            decoratedSupplier.get();
+        } catch (CallNotPermittedException ex) {
+            // Circuit breaker is open
+            logger.error("Circuit breaker is open. Skipping batch write.");
+        } catch (Exception ex) {
+            // Handle other exceptions
+            logger.error("Exception during batch write: ", ex);
+        }
+    }
+
+    private void writeBatchWithSdkRetries(List<Map<String, AttributeValue>> batch) {
+        Map<String, List<WriteRequest>> requestItems = new HashMap<>();
+        List<WriteRequest> writeRequests = batch.stream()
+                .map(item -> WriteRequest.builder()
+                        .putRequest(PutRequest.builder().item(item).build())
+                        .build())
+                .collect(Collectors.toList());
+
+        requestItems.put(tableName, writeRequests);
+
+        BatchWriteItemRequest batchWriteItemRequest = BatchWriteItemRequest.builder()
+                .requestItems(requestItems)
+                .build();
+
+        try {
+            BatchWriteItemResponse response = dynamoDbClient.batchWriteItem(batchWriteItemRequest);
+
+            // Handle unprocessed items
+            Map<String, List<WriteRequest>> unprocessedItems = response.unprocessedItems();
+
+            while (unprocessedItems != null && !unprocessedItems.isEmpty()) {
+                logger.warn("Retrying unprocessed items: {}", unprocessedItems.size());
+                BatchWriteItemRequest retryRequest = BatchWriteItemRequest.builder()
+                        .requestItems(unprocessedItems)
+                        .build();
+
+                response = dynamoDbClient.batchWriteItem(retryRequest);
+                unprocessedItems = response.unprocessedItems();
+            }
+        } catch (DynamoDbException e) {
+            logger.error("DynamoDB exception during batch write: ", e);
+            throw e;
+        }
+    }
+
+    // Utility method to partition the list into batches
+    private static <T> List<List<T>> partitionList(List<T> list, int size) {
+        List<List<T>> partitions = new ArrayList<>();
+        int i = 0;
+        int totalSize = list.size();
+        while (i < totalSize) {
+            partitions.add(list.subList(i, Math.min(totalSize, i + size)));
+            i += size;
+        }
+        return partitions;
+    }
+
+    public static void main(String[] args) {
+        // Create an instance of DynamoDBWriter
+        DynamoDBWriter writer = new DynamoDBWriter();
+
+        // Generate or retrieve the list of items to write
+        List<Map<String, AttributeValue>> itemsToWrite = new ArrayList<>();
+
+        // Example: Populate itemsToWrite with sample data
+        for (int i = 0; i < 15000; i++) {
+            Map<String, AttributeValue> item = new HashMap<>();
+            item.put("PrimaryKey", AttributeValue.builder().s("Item" + i).build());
+            item.put("Attribute", AttributeValue.builder().s("Value" + i).build());
+            itemsToWrite.add(item);
+        }
+
+        // Write the items to DynamoDB
+        writer.writeItems(itemsToWrite);
+    }
+}

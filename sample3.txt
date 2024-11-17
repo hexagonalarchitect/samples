@@ -1,0 +1,117 @@
+import software.amazon.awssdk.auth.credentials.ProfileCredentialsProvider;
+import software.amazon.awssdk.core.pagination.sync.SdkIterable;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
+import software.amazon.awssdk.services.dynamodb.model.*;
+
+import java.util.*;
+
+public class DeleteAllItemsFromTable {
+
+    public static void main(String[] args) {
+        String tableName = "YourTableName"; // Replace with your DynamoDB table name
+
+        // Create a DynamoDB client
+        DynamoDbClient ddb = DynamoDbClient.builder()
+                .region(Region.US_EAST_1) // Replace with your AWS region
+                .credentialsProvider(ProfileCredentialsProvider.create())
+                .build();
+
+        // Call the method to delete all items
+        deleteAllItems(ddb, tableName);
+
+        // Close the client
+        ddb.close();
+    }
+
+    public static void deleteAllItems(DynamoDbClient ddb, String tableName) {
+        try {
+            // Scan the table to retrieve all items
+            ScanRequest scanRequest = ScanRequest.builder()
+                    .tableName(tableName)
+                    .build();
+
+            // Use a paginator to handle large datasets
+            SdkIterable<ScanResponse> scanResponses = ddb.scanPaginator(scanRequest);
+
+            List<Map<String, AttributeValue>> keysToDelete = new ArrayList<>();
+
+            // Collect keys from scanned items
+            for (ScanResponse scanResponse : scanResponses) {
+                for (Map<String, AttributeValue> item : scanResponse.items()) {
+                    // Extract the primary key(s) from the item
+                    Map<String, AttributeValue> key = extractKeyFromItem(ddb, tableName, item);
+                    keysToDelete.add(key);
+
+                    // Delete items in batches of 25
+                    if (keysToDelete.size() == 25) {
+                        batchDeleteItems(ddb, tableName, keysToDelete);
+                        keysToDelete.clear();
+                    }
+                }
+            }
+
+            // Delete any remaining items
+            if (!keysToDelete.isEmpty()) {
+                batchDeleteItems(ddb, tableName, keysToDelete);
+            }
+
+            System.out.println("All items deleted from table: " + tableName);
+
+        } catch (DynamoDbException e) {
+            System.err.println("Failed to delete items from table: " + e.getMessage());
+        }
+    }
+
+    private static Map<String, AttributeValue> extractKeyFromItem(DynamoDbClient ddb, String tableName, Map<String, AttributeValue> item) {
+        // Describe the table to get the key schema
+        DescribeTableRequest describeTableRequest = DescribeTableRequest.builder()
+                .tableName(tableName)
+                .build();
+
+        DescribeTableResponse describeTableResponse = ddb.describeTable(describeTableRequest);
+        List<KeySchemaElement> keySchema = describeTableResponse.table().keySchema();
+
+        Map<String, AttributeValue> key = new HashMap<>();
+
+        // Extract key attributes based on the key schema
+        for (KeySchemaElement keyElement : keySchema) {
+            String keyName = keyElement.attributeName();
+            key.put(keyName, item.get(keyName));
+        }
+
+        return key;
+    }
+
+    private static void batchDeleteItems(DynamoDbClient ddb, String tableName, List<Map<String, AttributeValue>> keysToDelete) {
+        List<WriteRequest> writeRequests = new ArrayList<>();
+
+        for (Map<String, AttributeValue> key : keysToDelete) {
+            DeleteRequest deleteRequest = DeleteRequest.builder()
+                    .key(key)
+                    .build();
+
+            WriteRequest writeRequest = WriteRequest.builder()
+                    .deleteRequest(deleteRequest)
+                    .build();
+
+            writeRequests.add(writeRequest);
+        }
+
+        Map<String, List<WriteRequest>> requestItems = new HashMap<>();
+        requestItems.put(tableName, writeRequests);
+
+        BatchWriteItemRequest batchWriteItemRequest = BatchWriteItemRequest.builder()
+                .requestItems(requestItems)
+                .build();
+
+        BatchWriteItemResponse response = ddb.batchWriteItem(batchWriteItemRequest);
+
+        // Handle unprocessed items by retrying
+        while (!response.unprocessedItems().isEmpty()) {
+            response = ddb.batchWriteItem(BatchWriteItemRequest.builder()
+                    .requestItems(response.unprocessedItems())
+                    .build());
+        }
+    }
+}
